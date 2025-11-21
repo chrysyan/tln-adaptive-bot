@@ -1,0 +1,1 @@
+web: python3 tln_adaptive_bot.py --mode live
