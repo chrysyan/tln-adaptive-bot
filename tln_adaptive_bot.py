@@ -396,6 +396,77 @@ def dashboard():
     # alias to /status
     return status()
 
+from flask import send_file
+
+# -----------------------------
+# EXPORT: DOWNLOAD FILES
+# -----------------------------
+
+@app.route("/export/trades")
+def export_trades():
+    if not os.path.exists(TRADES_FILE):
+        return jsonify({"error": "trades.csv not found"}), 404
+    return send_file(TRADES_FILE, as_attachment=True)
+
+@app.route("/export/prices")
+def export_prices():
+    if not os.path.exists(PRICE_FILE):
+        return jsonify({"error": "price_history.csv not found"}), 404
+    return send_file(PRICE_FILE, as_attachment=True)
+
+@app.route("/export/state")
+def export_state():
+    if not os.path.exists(STATE_FILE):
+        return jsonify({"error": "state.json not found"}), 404
+    return send_file(STATE_FILE, as_attachment=True)
+
+
+# -----------------------------
+# Debug endpoints (read-only)
+# -----------------------------
+
+@app.route("/debug/files")
+def debug_files():
+    """Return list of generated files."""
+    files = []
+    for fname in [STATE_FILE, PRICE_FILE, TRADES_FILE, LOG_FILE]:
+        size = os.path.getsize(fname) if os.path.exists(fname) else 0
+        files.append({"file": fname, "exists": os.path.exists(fname), "size": size})
+    return jsonify({"version": BOT_VERSION, "files": files})
+
+
+@app.route("/debug/trades")
+def debug_trades():
+    """Return last 200 lines from trades.csv."""
+    if not os.path.exists(TRADES_FILE):
+        return jsonify({"error": "trades.csv not found"})
+    try:
+        with open(TRADES_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return jsonify({
+            "version": BOT_VERSION,
+            "lines": lines[-200:]  # last 200 entries
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/debug/log")
+def debug_log():
+    """Return last 300 lines from bot.log."""
+    if not os.path.exists(LOG_FILE):
+        return jsonify({"error": "bot.log not found"})
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return jsonify({
+            "version": BOT_VERSION,
+            "lines": lines[-300:]  # last 300 logs
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 def run_flask():
     if FLASK_ENABLED:
         try:
