@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-tln_adaptive_bot.py - Replit-ready resilient adaptive bot + status endpoints
+tln_adaptive_bot.py - Render-ready resilient adaptive bot + status endpoints
 
-- Restart loop / watchdog: bucla principală rulează într-un loop extern care
-  repornește run_live() la excepții.
-- Endpoints:
-    /        -> health
-    /health  -> health JSON
-    /status  -> detailed status (usdt, tln, last_price, last_exec_ts, trade_count)
-    /dashboard -> same as /status
-- Safety: no private keys, paper-trading only
+Variant 1 (patched):
+ - fetch full history from Dexscreener at startup (rebuild price_history.csv
+   when full history is available)
+ - cache / backoff to reduce API calls for Render Free
+ - optional export_state_to_remote() using boto3/S3 if AWS env vars provided
+ - keep watchdog + flask endpoints + export/debug endpoints
+ - safe for paper-trading only
 """
 
 import requests, time, csv, json, os, math, threading, traceback
-from datetime import datetime
-from flask import Flask, jsonify
+from datetime import datetime, timezone
+from flask import Flask, jsonify, send_file, Response
 
 # -----------------------------
 # CONFIG (editează pentru cloud)
 # -----------------------------
-BOT_VERSION = "1.1-replit-stable-20251118"
+BOT_VERSION = "1.2-render-variant1-20251121"
 TOKEN_CONTRACT = "0xAa90a8CDAB8B8E902293a2817d1d286f66cBcec5"
 DEXSCREENER_TOKEN_API = f"https://api.dexscreener.com/latest/dex/tokens/{TOKEN_CONTRACT}"
+DEXSCREENER_CHART_API = f"https://api.dexscreener.com/latest/dex/token/{TOKEN_CONTRACT}/chart"  # fallback (some installations)
 
 # recommended cloud run params
 POLL_INTERVAL = 60              # seconds between checks
@@ -39,7 +39,7 @@ PRICE_FILE = "price_history.csv"
 TRADES_FILE = "trades.csv"
 LOG_FILE = "bot.log"
 
-# Flask / Replit
+# Flask / Render
 TEST_MODE = False
 FLASK_ENABLED = True
 FLASK_PORT = int(os.environ.get("PORT", 5000))
@@ -47,6 +47,25 @@ FLASK_PORT = int(os.environ.get("PORT", 5000))
 # resilience
 RETRY_BACKOFF_BASE = 5    # seconds initial backoff after an uncaught exception
 MAX_BACKOFF = 300         # cap backoff to 5 minutes
+
+# API caching / rate-limit friendly
+CACHE_TTL_SEC = 20        # if price unchanged, keep cached value for this time
+_last_price_cache = {"price": None, "ts": 0}
+
+# remote export / persistence
+REMOTE_EXPORT_INTERVAL_SEC = int(os.environ.get("REMOTE_EXPORT_INTERVAL_SEC", 3600))  # hourly default
+_last_remote_export = {"ts": 0, "status": None}
+
+# optional S3 config via env (if you want long-term storage)
+AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")
+AWS_S3_PREFIX = os.environ.get("AWS_S3_PREFIX", "tln_bot_exports")
+# NOTE: boto3 is optional; we try to import and if missing, export_state_to_remote is a no-op
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+    _HAS_BOTO3 = True
+except Exception:
+    _HAS_BOTO3 = False
 
 # globals for endpoints
 LAST_PRICE = None
@@ -59,8 +78,11 @@ _lock = threading.Lock()
 # -----------------------------
 # Utilities: logging & csv
 # -----------------------------
+def now_iso():
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
 def log(msg):
-    ts = datetime.utcnow().isoformat()
+    ts = now_iso()
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
@@ -123,33 +145,110 @@ def save_state(state):
         log(f"save_state error: {e}")
 
 # -----------------------------
-# Price fetch with validation
+# Dexscreener history fetch (attempt full history at startup)
 # -----------------------------
-def fetch_price_live():
-    """Return float price or None on any problem."""
+def fetch_full_history_from_dexscreener():
+    """
+    Try to fetch as much historical data as possible from Dexscreener.
+    Returns list of (ts, price) tuples sorted ascending by ts, or None if failure.
+    Note: Dexscreener's public API shapes may vary; we attempt common patterns.
+    """
+    try:
+        log("Attempting full history fetch from Dexscreener...")
+        r = requests.get(DEXSCREENER_TOKEN_API, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # Dexscreener often returns 'chart' or 'pairs' or 'historical' fields in various endpoints.
+        # Common pattern: data['chart'] is list of [ts_ms, price]
+        if "chart" in data and isinstance(data["chart"], list):
+            rows = []
+            for item in data["chart"]:
+                if isinstance(item, list) and len(item) >= 2:
+                    ts_ms = int(item[0])
+                    price = float(item[1])
+                    rows.append((int(ts_ms/1000), price))
+            if rows:
+                rows.sort(key=lambda x: x[0])
+                log(f"Fetched {len(rows)} chart points from Dexscreener (chart).")
+                return rows
+        # Another possible structure: data['pairs'][0]['chart'] etc.
+        pairs = data.get("pairs") or []
+        for p in pairs:
+            if "chart" in p and isinstance(p["chart"], list):
+                rows = []
+                for item in p["chart"]:
+                    if isinstance(item, list) and len(item) >= 2:
+                        ts_ms = int(item[0])
+                        price = float(item[1])
+                        rows.append((int(ts_ms/1000), price))
+                if rows:
+                    rows.sort(key=lambda x: x[0])
+                    log(f"Fetched {len(rows)} chart points from Dexscreener (pair.chart).")
+                    return rows
+        # Try the chart endpoint (fallback)
+        try:
+            r2 = requests.get(DEXSCREENER_CHART_API, timeout=15)
+            r2.raise_for_status()
+            d2 = r2.json()
+            if isinstance(d2, dict) and "chart" in d2:
+                rows = []
+                for item in d2["chart"]:
+                    if isinstance(item, list) and len(item) >= 2:
+                        ts_ms = int(item[0])
+                        price = float(item[1])
+                        rows.append((int(ts_ms/1000), price))
+                if rows:
+                    rows.sort(key=lambda x: x[0])
+                    log(f"Fetched {len(rows)} chart points from Dexscreener (chart endpoint).")
+                    return rows
+        except Exception:
+            pass
+        log("Dexscreener: no full historical chart found in expected fields.")
+        return None
+    except Exception as e:
+        log(f"fetch_full_history_from_dexscreener error: {e}")
+        return None
+
+# -----------------------------
+# Price fetch with caching/backoff
+# -----------------------------
+def fetch_price_live(force_refresh=False):
+    """Return float price or None on any problem. Uses small cache to reduce calls."""
+    global _last_price_cache
+    now_ts = time.time()
+    # simple cache check
+    if not force_refresh:
+        cached = _last_price_cache.get("price")
+        cached_ts = _last_price_cache.get("ts", 0)
+        if cached is not None and (now_ts - cached_ts) < CACHE_TTL_SEC:
+            return cached
+
     try:
         r = requests.get(DEXSCREENER_TOKEN_API, timeout=10)
         r.raise_for_status()
         data = r.json()
         pairs = data.get("pairs") or []
+        price_val = None
         for p in pairs:
             price = p.get("priceUsd")
             if price:
-                # validate number-like
                 try:
                     pval = float(price)
                     if pval > 0 and math.isfinite(pval):
-                        return pval
+                        price_val = pval
+                        break
                 except:
                     continue
-        # fallback if no usable pair
-        if pairs:
+        # fallback
+        if price_val is None and pairs:
             try:
-                pval = float(pairs[0].get("priceUsd", 0))
-                if pval > 0 and math.isfinite(pval):
-                    return pval
+                price_val = float(pairs[0].get("priceUsd", 0))
             except:
-                pass
+                price_val = None
+        if price_val is not None:
+            _last_price_cache["price"] = price_val
+            _last_price_cache["ts"] = now_ts
+            return price_val
         return None
     except Exception as e:
         log(f"Price fetch error: {e}")
@@ -264,13 +363,74 @@ def run_backtest(history_csv):
     log(f"Backtest complete. Final USDT={final_usdt:.4f}, TLN={final_tln:.6f}, TotalEquiv={total:.4f}")
 
 # -----------------------------
+# Remote export (optional)
+# -----------------------------
+def export_state_to_remote():
+    """
+    Try to upload state.json and trades/price files to S3 if configured.
+    If boto3 missing or AWS not configured, just log and return False.
+    """
+    global _last_remote_export
+    now_ts = time.time()
+    # rate-limit uploads
+    if now_ts - _last_remote_export.get("ts", 0) < REMOTE_EXPORT_INTERVAL_SEC:
+        return _last_remote_export.get("status", None)
+
+    if not _HAS_BOTO3:
+        log("export_state_to_remote: boto3 not available, skipping remote export.")
+        _last_remote_export.update({"ts": now_ts, "status": False})
+        return False
+
+    if not AWS_S3_BUCKET:
+        log("export_state_to_remote: AWS_S3_BUCKET not set, skipping remote export.")
+        _last_remote_export.update({"ts": now_ts, "status": False})
+        return False
+
+    s3 = boto3.client("s3")
+    try:
+        for fname in [STATE_FILE, TRADES_FILE, PRICE_FILE]:
+            if not os.path.exists(fname):
+                continue
+            key = f"{AWS_S3_PREFIX}/{os.path.basename(fname)}"
+            log(f"Uploading {fname} -> s3://{AWS_S3_BUCKET}/{key}")
+            s3.upload_file(fname, AWS_S3_BUCKET, key)
+        _last_remote_export.update({"ts": now_ts, "status": True})
+        log("export_state_to_remote: upload successful.")
+        return True
+    except (BotoCoreError, ClientError) as e:
+        log(f"export_state_to_remote error: {e}")
+        _last_remote_export.update({"ts": now_ts, "status": False})
+        return False
+    except Exception as e:
+        log(f"export_state_to_remote unexpected error: {e}")
+        _last_remote_export.update({"ts": now_ts, "status": False})
+        return False
+
+# -----------------------------
 # Main live loop (keeps own exceptions local)
 # -----------------------------
 def run_live(poll_interval=POLL_INTERVAL):
-    global LAST_PRICE, LAST_PRICE_TS, LAST_LOOP_TS, PRICE_SAMPLES_COUNT
+    global LAST_PRICE, LAST_PRICE_TS, LAST_LOOP_TS, PRICE_SAMPLES_COUNT, _last_remote_export
     ensure_csv_headers()
+
+    # Attempt to fetch full history at startup. If found, rebuild price_history.csv.
+    full_hist = fetch_full_history_from_dexscreener()
+    if full_hist:
+        try:
+            with open(PRICE_FILE, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp", "price"])
+                for ts, price in full_hist:
+                    w.writerow([ts, f"{price:.8f}"])
+            log(f"Rebuilt {PRICE_FILE} with {len(full_hist)} points from Dexscreener.")
+        except Exception as e:
+            log(f"Error rebuilding price file: {e}")
+    else:
+        log("Full history unavailable; will use existing price_history.csv (if any).")
+
     state = load_state()
     price_buffer = []
+
     log(f"Starting LIVE mode. Version={BOT_VERSION}")
     while True:
         try:
@@ -318,13 +478,20 @@ def run_live(poll_interval=POLL_INTERVAL):
                 time.sleep(poll_interval)
                 continue
 
-            # Decision
+            # Decision (same logic as before)
             if price <= buy_thr:
                 ok, info = simulate_buy(state, price, min(POSITION_SIZE_USDT, state["usdt"]))
                 if not ok:
                     log(f"Buy skipped: {info}")
             elif price >= sell_thr and state.get("tln", 0.0) > 0:
                 simulate_sell(state, price, pct=1.0)
+
+            # periodic remote export (best-effort)
+            try:
+                if time.time() - _last_remote_export.get("ts", 0) >= REMOTE_EXPORT_INTERVAL_SEC:
+                    export_state_to_remote()
+            except Exception as e:
+                log(f"Periodic remote export failed: {e}")
 
             LAST_LOOP_TS = int(time.time())
             time.sleep(poll_interval)
@@ -396,8 +563,6 @@ def dashboard():
     # alias to /status
     return status()
 
-from flask import send_file
-
 # -----------------------------
 # EXPORT: DOWNLOAD FILES
 # -----------------------------
@@ -420,11 +585,9 @@ def export_state():
         return jsonify({"error": "state.json not found"}), 404
     return send_file(STATE_FILE, as_attachment=True)
 
-
 # -----------------------------
 # Debug endpoints (read-only)
 # -----------------------------
-
 @app.route("/debug/files")
 def debug_files():
     """Return list of generated files."""
@@ -433,7 +596,6 @@ def debug_files():
         size = os.path.getsize(fname) if os.path.exists(fname) else 0
         files.append({"file": fname, "exists": os.path.exists(fname), "size": size})
     return jsonify({"version": BOT_VERSION, "files": files})
-
 
 @app.route("/debug/trades")
 def debug_trades():
@@ -450,7 +612,6 @@ def debug_trades():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-
 @app.route("/debug/log")
 def debug_log():
     """Return last 300 lines from bot.log."""
@@ -466,6 +627,9 @@ def debug_log():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+@app.route("/debug/remote_export_status")
+def debug_remote_export_status():
+    return jsonify(_last_remote_export)
 
 def run_flask():
     if FLASK_ENABLED:
