@@ -873,12 +873,11 @@ def run_live(poll_interval=POLL_INTERVAL):
                         log("LIVE: entry_plan mode set to inactive (stop loss hit).")
                     else:
                         log("LIVE: waiting_for_sell -> HOLD (no TP/SL condition).")
-
             else:
                 # inactive sau mod necunoscut
                 log("LIVE: entry_plan mode is inactive; no further trades will be made.")
-                # aici doar dormim; poți decide să ieși din loop dacă vrei ca botul să se oprească
-                break
+                time.sleep(poll_interval)
+                continue
 
             LAST_LOOP_TS = int(time.time())
             time.sleep(poll_interval)
