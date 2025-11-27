@@ -338,6 +338,203 @@ def rebuild_price_history_from_moralis(path=PRICE_FILE):
     return True
 
 # -----------------------------
+# OHLCV history loader (for technical analysis)
+# -----------------------------
+def load_ohlcv_history(path=PRICE_FILE, max_rows=None):
+    """
+    Încarcă price_history.csv în format OHLCV (Format A).
+    Returnează listă de dict-uri:
+      {
+        "timestamp_unix": int,
+        "timestamp_iso": str,
+        "open": float,
+        "high": float,
+        "low": float,
+        "close": float,
+        "volume": float
+      }
+    """
+    if not os.path.exists(path):
+        log(f"OHLCV history file {path} does not exist.")
+        return []
+
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    ts_unix = int(row.get("timestamp_unix") or row.get("timestamp") or 0)
+                    close = float(row.get("close"))
+                    open_p = float(row.get("open"))
+                    high = float(row.get("high"))
+                    low = float(row.get("low"))
+                    vol = float(row.get("volume"))
+                except Exception:
+                    continue
+                rows.append({
+                    "timestamp_unix": ts_unix,
+                    "timestamp_iso": row.get("timestamp_iso") or "",
+                    "open": open_p,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": vol
+                })
+    except Exception as e:
+        log(f"load_ohlcv_history error: {e}")
+        return []
+
+    rows.sort(key=lambda x: x["timestamp_unix"])
+    if max_rows and len(rows) > max_rows:
+        rows = rows[-max_rows:]
+    return rows
+
+# -----------------------------
+# Technical analysis: support/resistance, trend, volatility
+# -----------------------------
+def compute_technical_state(candles):
+    """
+    Primește o listă de lumânări OHLCV (1h).
+    Returnează un dict cu:
+      - trend: "bull"/"bear"/"sideways"
+      - support, resistance
+      - volatility_rel
+      - atr (Average True Range simplificat)
+      - ma_fast (24h), ma_slow (168h)
+      - last_close
+    """
+    if not candles or len(candles) < 50:
+        log("Not enough candles for technical analysis.")
+        return None
+
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    n = len(closes)
+
+    # suport / rezistență = percentile 20% și 80% din ultimele 200 ore
+    tail = closes[-200:] if n > 200 else closes[:]
+    tail_sorted = sorted(tail)
+
+    def percentile(arr, p):
+        if not arr:
+            return None
+        k = max(0, min(len(arr) - 1, int(len(arr) * p)))
+        return arr[k]
+
+    support = percentile(tail_sorted, 0.2)
+    resistance = percentile(tail_sorted, 0.8)
+
+    # medii mobile
+    def mean_last(arr, k):
+        if len(arr) < 1:
+            return None
+        if len(arr) < k:
+            k = len(arr)
+        return sum(arr[-k:]) / k
+
+    ma_fast = mean_last(closes, 24)   # ~1 zi
+    ma_slow = mean_last(closes, 168)  # ~1 săptămână
+
+    # trend simplu
+    trend = "sideways"
+    if ma_fast is not None and ma_slow is not None and ma_slow > 0:
+        ratio = ma_fast / ma_slow
+        if ratio > 1.01:
+            trend = "bull"
+        elif ratio < 0.99:
+            trend = "bear"
+
+    # volatilitate relativă pe ultimele 48 ore
+    vol_tail = closes[-48:] if n > 48 else closes[:]
+    if len(vol_tail) > 1:
+        mean_v = sum(vol_tail) / len(vol_tail)
+        var = sum((p - mean_v) ** 2 for p in vol_tail) / (len(vol_tail) - 1)
+        std = math.sqrt(var)
+        volatility_rel = std / mean_v if mean_v > 0 else 0.0
+    else:
+        volatility_rel = 0.0
+
+    # ATR simplu pe ultimele 48 ore
+    atr_values = []
+    prev_close = closes[0]
+    for i in range(1, len(candles)):
+        h = highs[i]
+        l = lows[i]
+        c_prev = prev_close
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        atr_values.append(tr)
+        prev_close = closes[i]
+    if atr_values:
+        atr_tail = atr_values[-48:] if len(atr_values) > 48 else atr_values
+        atr = sum(atr_tail) / len(atr_tail)
+    else:
+        atr = 0.0
+
+    last_close = closes[-1]
+
+    log(f"Technical state: trend={trend}, support={support:.6f}, resistance={resistance:.6f}, "
+        f"vol_rel={volatility_rel:.4f}, atr={atr:.6f}, last_close={last_close:.6f}")
+
+    return {
+        "trend": trend,
+        "support": support,
+        "resistance": resistance,
+        "volatility_rel": volatility_rel,
+        "atr": atr,
+        "ma_fast": ma_fast,
+        "ma_slow": ma_slow,
+        "last_close": last_close
+    }
+
+# -----------------------------
+# Entry plan: buy, take-profit, stop-loss
+# -----------------------------
+def compute_entry_levels(tech_state):
+    """
+    Din starea tehnică derivăm:
+      - buy_price
+      - take_profit
+      - stop_loss
+    """
+    support = tech_state.get("support")
+    resistance = tech_state.get("resistance")
+    atr = tech_state.get("atr") or 0.0
+    trend = tech_state.get("trend")
+
+    if support is None or resistance is None:
+        log("Support/resistance missing; cannot compute entry levels.")
+        return None
+
+    # BUY: în zona de suport, ajustat cu trend
+    buy_price = support
+    if trend == "bull" and atr > 0:
+        buy_price = support + 0.2 * atr
+    elif trend == "bear" and atr > 0:
+        buy_price = max(0.0, support - 0.5 * atr)
+
+    # TAKE PROFIT: în zona de rezistență, ușor ajustat
+    take_profit = resistance
+    if trend == "bear" and atr > 0:
+        take_profit = max(0.0, resistance - 0.2 * atr)
+    elif trend == "sideways" and atr > 0:
+        take_profit = max(0.0, resistance - 0.1 * atr)
+
+    # STOP LOSS: sub buy, în funcție de ATR
+    if atr > 0:
+        stop_loss = max(0.0, buy_price - 2.0 * atr)
+    else:
+        stop_loss = max(0.0, buy_price * 0.9)  # fallback simplu
+
+    log(f"Entry levels: buy={buy_price:.6f}, tp={take_profit:.6f}, sl={stop_loss:.6f}")
+    return {
+        "buy_price": buy_price,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss
+    }
+
+# -----------------------------
 # Price fetch with caching/backoff
 # -----------------------------
 def fetch_price_live(force_refresh=False):
@@ -541,8 +738,7 @@ def run_live(poll_interval=POLL_INTERVAL):
     global LAST_PRICE, LAST_PRICE_TS, LAST_LOOP_TS, PRICE_SAMPLES_COUNT, _last_remote_export
     ensure_csv_headers()
 
-    # La startup: dacă avem MORALIS_API_KEY, încercăm să reconstruim istoricul DOAR dacă
-    # fișierul e gol sau incomplet (Pornire B).
+    # 1) Istoric Moralis dacă e nevoie
     try:
         if MORALIS_API_KEY:
             if is_price_history_incomplete(PRICE_FILE):
@@ -555,7 +751,38 @@ def run_live(poll_interval=POLL_INTERVAL):
     except Exception as e:
         log(f"Moralis history init failed: {e}. Will continue with existing price_history.csv (if any).")
 
+    # 2) Încărcăm state + istoricul OHLCV
     state = load_state()
+    candles = load_ohlcv_history(PRICE_FILE)
+    if not candles or len(candles) < 50:
+        log("LIVE: not enough OHLCV data; bot cannot trade safely.")
+    else:
+        # dacă nu avem încă un entry_plan, îl calculăm
+        if "entry_plan" not in state or not isinstance(state["entry_plan"], dict):
+            log("LIVE: computing technical state and entry plan...")
+            tech = compute_technical_state(candles)
+            if tech:
+                levels = compute_entry_levels(tech)
+                if levels:
+                    # stabilim modul inițial în funcție de poziția curentă
+                    tln_balance = state.get("tln", 0.0)
+                    mode = "waiting_for_buy" if tln_balance <= 0 else "waiting_for_sell"
+                    state["entry_plan"] = {
+                        "buy_price": levels["buy_price"],
+                        "take_profit": levels["take_profit"],
+                        "stop_loss": levels["stop_loss"],
+                        "mode": mode,
+                        "created_at": now_iso()
+                    }
+                    save_state(state)
+                    log(f"LIVE: entry_plan initialized with mode={mode}.")
+                else:
+                    log("LIVE: could not compute entry levels; entry_plan not set.")
+            else:
+                log("LIVE: technical state not available; entry_plan not set.")
+        else:
+            log("LIVE: entry_plan already present in state; reusing it.")
+
     price_buffer = []
 
     log(f"Starting LIVE mode. Version={BOT_VERSION}")
@@ -569,62 +796,94 @@ def run_live(poll_interval=POLL_INTERVAL):
 
             ts = int(time.time())
 
-            # update global last price safely
+            # update global last price (pentru /status)
             with _lock:
                 LAST_PRICE = price
                 LAST_PRICE_TS = ts
 
-            price_buffer.append(price)
-            PRICE_SAMPLES_COUNT = len(price_buffer)
-            if len(price_buffer) > ROLLING_WINDOW:
-                price_buffer.pop(0)
+            log(f"LIVE price {price:.8f}")
 
-            log(f"Price {price:.8f} | samples {len(price_buffer)}/{ROLLING_WINDOW}")
+            state = load_state()
+            entry_plan = state.get("entry_plan")
+            tln_balance = state.get("tln", 0.0)
+            usdt_balance = state.get("usdt", 0.0)
 
-            # quick-exit in TEST_MODE
-            if TEST_MODE:
-                ok, info = simulate_buy(state, price, min(POSITION_SIZE_USDT, state["usdt"]))
-                if not ok:
-                    log(f"Test buy failed: {info}")
+            if not entry_plan or not isinstance(entry_plan, dict):
+                log("LIVE: no entry_plan in state; sleeping (no trading).")
+                time.sleep(poll_interval)
+                continue
+
+            mode = entry_plan.get("mode", "inactive")
+            buy_price = entry_plan.get("buy_price")
+            take_profit = entry_plan.get("take_profit")
+            stop_loss = entry_plan.get("stop_loss")
+
+            # log de status
+            log(f"LIVE status: mode={mode}, buy={buy_price}, tp={take_profit}, sl={stop_loss}, "
+                f"USDT={usdt_balance:.4f}, TLN={tln_balance:.6f}")
+
+            if mode == "waiting_for_buy":
+                # nu avem poziție TLN (ideal tln_balance=0)
+                if price <= buy_price and usdt_balance > 0:
+                    amount_to_use = min(POSITION_SIZE_USDT, usdt_balance)
+                    if amount_to_use > 0:
+                        log(f"LIVE: price <= buy_price -> BUY using {amount_to_use:.4f} USDT.")
+                        ok, info = simulate_buy(state, price, amount_to_use)
+                        if ok:
+                            # recitim state (simulate_buy a făcut save_state)
+                            state = load_state()
+                            tln_balance = state.get("tln", 0.0)
+                            entry_plan = state.get("entry_plan", entry_plan)
+                            entry_plan["mode"] = "waiting_for_sell"
+                            state["entry_plan"] = entry_plan
+                            save_state(state)
+                            log("LIVE: entry_plan mode switched to waiting_for_sell.")
+                        else:
+                            log(f"LIVE: BUY skipped: {info}")
+                    else:
+                        log("LIVE: no USDT available for BUY.")
                 else:
-                    log("Test buy recorded in trades.csv (TEST_MODE). Exiting.")
-                return
+                    log("LIVE: waiting_for_buy -> no condition met this tick.")
 
-            if len(price_buffer) < max(3, ROLLING_WINDOW):
-                time.sleep(poll_interval)
-                continue
+            elif mode == "waiting_for_sell":
+                # avem TLN și așteptăm TP sau SL
+                if tln_balance <= 0:
+                    log("LIVE: waiting_for_sell but TLN balance is 0 -> switching to inactive.")
+                    entry_plan["mode"] = "inactive"
+                    state["entry_plan"] = entry_plan
+                    save_state(state)
+                else:
+                    if price >= take_profit:
+                        log("LIVE: price >= take_profit -> SELL ALL (take profit).")
+                        simulate_sell(state, price, pct=1.0)
+                        state = load_state()
+                        entry_plan = state.get("entry_plan", entry_plan)
+                        entry_plan["mode"] = "inactive"
+                        state["entry_plan"] = entry_plan
+                        save_state(state)
+                        log("LIVE: entry_plan mode set to inactive (take profit reached).")
+                    elif price <= stop_loss:
+                        log("LIVE: price <= stop_loss -> SELL ALL (stop loss).")
+                        simulate_sell(state, price, pct=1.0)
+                        state = load_state()
+                        entry_plan = state.get("entry_plan", entry_plan)
+                        entry_plan["mode"] = "inactive"
+                        state["entry_plan"] = entry_plan
+                        save_state(state)
+                        log("LIVE: entry_plan mode set to inactive (stop loss hit).")
+                    else:
+                        log("LIVE: waiting_for_sell -> HOLD (no TP/SL condition).")
 
-            mean, std, buy_thr, sell_thr = compute_thresholds(price_buffer, K_STD)
-            log(f"Mean={mean:.8f} Std={std:.8f} BUY<{buy_thr:.8f} SELL>{sell_thr:.8f}")
-
-            # cooldown check
-            last_trade_ts = state.get("last_trade_ts") or 0
-            if time.time() - last_trade_ts < COOLDOWN_AFTER_TRADE:
-                log("In cooldown after last trade; skipping decision.")
-                time.sleep(poll_interval)
-                continue
-
-            # Decision (same logic as before)
-            if price <= buy_thr:
-                ok, info = simulate_buy(state, price, min(POSITION_SIZE_USDT, state["usdt"]))
-                if not ok:
-                    log(f"Buy skipped: {info}")
-            elif price >= sell_thr and state.get("tln", 0.0) > 0:
-                simulate_sell(state, price, pct=1.0)
-
-            # periodic remote export (best-effort)
-            try:
-                if time.time() - _last_remote_export.get("ts", 0) >= REMOTE_EXPORT_INTERVAL_SEC:
-                    export_state_to_remote()
-            except Exception as e:
-                log(f"Periodic remote export failed: {e}")
+            else:
+                # inactive sau mod necunoscut
+                log("LIVE: entry_plan mode is inactive; no further trades will be made.")
+                # aici doar dormim; poți decide să ieși din loop dacă vrei ca botul să se oprească
+                break
 
             LAST_LOOP_TS = int(time.time())
             time.sleep(poll_interval)
 
         except Exception as e:
-            # catch unexpected exception inside live loop,
-            # log traceback and re-raise to outer watchdog (or sleep and continue local)
             log(f"Unhandled exception in run_live: {e}")
             tb = traceback.format_exc()
             log(tb)
