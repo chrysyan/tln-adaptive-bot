@@ -23,6 +23,23 @@ TOKEN_CONTRACT = "0xAa90a8CDAB8B8E902293a2817d1d286f66cBcec5"
 DEXSCREENER_TOKEN_API = f"https://api.dexscreener.com/latest/dex/tokens/{TOKEN_CONTRACT}"
 DEXSCREENER_CHART_API = f"https://api.dexscreener.com/latest/dex/token/{TOKEN_CONTRACT}/chart"  # fallback (some installations)
 
+# Moralis OHLCV history (TLNGOLD/USDT)
+MORALIS_API_KEY = os.environ.get("MORALIS_API_KEY", "").strip()
+MORALIS_BASE_URL = "https://deep-index.moralis.io/api/v2.2"
+
+# Pair TLNGOLD/USDT Pancake v2 (BNB Smart Chain)
+TLN_USDT_PAIR = "0x1e7ea2ec47199191dc3b642bb6c24ed03cc1a641"
+
+# Timeframe pentru istoricul OHLCV (configurat pentru 1h, dar îl poți override din env)
+MORALIS_TIMEFRAME = os.environ.get("MORALIS_TIMEFRAME", "1h")
+
+# Data de început (Moralis va returna efectiv doar de când există pair-ul)
+MORALIS_FROM_DATE = os.environ.get("MORALIS_FROM_DATE", "2024-01-01T00:00:00Z")
+
+# Heuristici pentru a decide dacă price_history.csv e "incomplet"
+HISTORY_MIN_POINTS = int(os.environ.get("HISTORY_MIN_POINTS", "100"))
+HISTORY_MAX_AGE_HOURS = int(os.environ.get("HISTORY_MAX_AGE_HOURS", "6"))
+
 # recommended cloud run params
 POLL_INTERVAL = 60              # seconds between checks
 ROLLING_WINDOW = 20
@@ -97,11 +114,9 @@ def ensure_csv_headers():
         with open(TRADES_FILE, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["timestamp","action","price","amount_tln","usdt_value","bot_version"])
-    # price history
-    if not os.path.exists(PRICE_FILE):
-        with open(PRICE_FILE, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["timestamp","price"])
+    # price_history.csv NU îl mai creăm aici;
+    # el va fi creat/reconstruit de logica Moralis (OHLCV) sau de backtest,
+    # ca să nu stricăm formatul său.
 
 def append_price(ts, price):
     try:
@@ -145,69 +160,182 @@ def save_state(state):
         log(f"save_state error: {e}")
 
 # -----------------------------
-# Dexscreener history fetch (attempt full history at startup)
+# Moralis OHLCV history (TLNGOLD/USDT)
 # -----------------------------
-def fetch_full_history_from_dexscreener():
-    """
-    Try to fetch as much historical data as possible from Dexscreener.
-    Returns list of (ts, price) tuples sorted ascending by ts, or None if failure.
-    Note: Dexscreener's public API shapes may vary; we attempt common patterns.
-    """
-    try:
-        log("Attempting full history fetch from Dexscreener...")
-        r = requests.get(DEXSCREENER_TOKEN_API, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        # Dexscreener often returns 'chart' or 'pairs' or 'historical' fields in various endpoints.
-        # Common pattern: data['chart'] is list of [ts_ms, price]
-        if "chart" in data and isinstance(data["chart"], list):
-            rows = []
-            for item in data["chart"]:
-                if isinstance(item, list) and len(item) >= 2:
-                    ts_ms = int(item[0])
-                    price = float(item[1])
-                    rows.append((int(ts_ms/1000), price))
-            if rows:
-                rows.sort(key=lambda x: x[0])
-                log(f"Fetched {len(rows)} chart points from Dexscreener (chart).")
-                return rows
-        # Another possible structure: data['pairs'][0]['chart'] etc.
-        pairs = data.get("pairs") or []
-        for p in pairs:
-            if "chart" in p and isinstance(p["chart"], list):
-                rows = []
-                for item in p["chart"]:
-                    if isinstance(item, list) and len(item) >= 2:
-                        ts_ms = int(item[0])
-                        price = float(item[1])
-                        rows.append((int(ts_ms/1000), price))
-                if rows:
-                    rows.sort(key=lambda x: x[0])
-                    log(f"Fetched {len(rows)} chart points from Dexscreener (pair.chart).")
-                    return rows
-        # Try the chart endpoint (fallback)
+def _moralis_get(url, params):
+    if not MORALIS_API_KEY:
+        raise RuntimeError("MORALIS_API_KEY is not set; cannot fetch history from Moralis.")
+    headers = {
+        "X-API-Key": MORALIS_API_KEY,
+        "accept": "application/json",
+    }
+    delay = 1.0
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            r2 = requests.get(DEXSCREENER_CHART_API, timeout=15)
-            r2.raise_for_status()
-            d2 = r2.json()
-            if isinstance(d2, dict) and "chart" in d2:
-                rows = []
-                for item in d2["chart"]:
-                    if isinstance(item, list) and len(item) >= 2:
-                        ts_ms = int(item[0])
-                        price = float(item[1])
-                        rows.append((int(ts_ms/1000), price))
-                if rows:
-                    rows.sort(key=lambda x: x[0])
-                    log(f"Fetched {len(rows)} chart points from Dexscreener (chart endpoint).")
-                    return rows
-        except Exception:
-            pass
-        log("Dexscreener: no full historical chart found in expected fields.")
-        return None
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                log(f"Moralis GET {url} failed ({r.status_code}): {r.text[:200]}")
+        except Exception as e:
+            log(f"Moralis GET exception: {e}")
+        if attempt < max_retries - 1:
+            log(f"Moralis: retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"Moralis GET {url} failed after {max_retries} attempts.")
+
+
+def is_price_history_incomplete(path=PRICE_FILE):
+    """
+    Heuristică simplă:
+    - dacă fișierul nu există -> incomplet
+    - dacă are prea puține puncte -> incomplet
+    - dacă ultimul punct este prea vechi -> incomplet
+    """
+    if not os.path.exists(path):
+        log("price_history.csv does not exist -> considered incomplete.")
+        return True
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
     except Exception as e:
-        log(f"fetch_full_history_from_dexscreener error: {e}")
-        return None
+        log(f"Failed to read {path}: {e} -> considered incomplete.")
+        return True
+
+    if len(rows) < HISTORY_MIN_POINTS:
+        log(f"price_history.csv has only {len(rows)} rows (< {HISTORY_MIN_POINTS}) -> incomplete.")
+        return True
+
+    last = rows[-1]
+    ts_str = last.get("timestamp_iso") or last.get("timestamp")
+    if not ts_str:
+        log("Last row in price_history.csv has no timestamp -> incomplete.")
+        return True
+
+    try:
+        # suportă formate ISO cu 'Z'
+        ts_str2 = ts_str.replace("Z", "+00:00") if "Z" in ts_str and "+" not in ts_str else ts_str
+        last_dt = datetime.fromisoformat(ts_str2)
+    except Exception:
+        try:
+            # fallback: timestamp Unix
+            last_dt = datetime.fromtimestamp(int(last.get("timestamp_unix", 0)), tz=timezone.utc)
+        except Exception as e:
+            log(f"Could not parse last timestamp in price_history.csv: {e} -> incomplete.")
+            return True
+
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+
+    age_hours = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
+    if age_hours > HISTORY_MAX_AGE_HOURS:
+        log(f"Last price point is {age_hours:.1f}h old (> {HISTORY_MAX_AGE_HOURS}h) -> incomplete.")
+        return True
+
+    log("price_history.csv looks recent and complete enough.")
+    return False
+
+
+def fetch_ohlcv_from_moralis():
+    """
+    Descarcă tot istoricul OHLCV (timeframe 1h) pentru TLNGOLD/USDT de la Moralis.
+    Returnează o listă de dict-uri cu:
+      - timestamp_unix
+      - timestamp_iso
+      - open, high, low, close, volume
+    """
+    url = f"{MORALIS_BASE_URL}/pairs/{TLN_USDT_PAIR}/ohlcv"
+    params = {
+        "chain": "bsc",
+        "timeframe": MORALIS_TIMEFRAME,
+        "fromDate": MORALIS_FROM_DATE,
+        # toDate -> acum
+        "toDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    all_items = []
+    cursor = None
+    page = 0
+
+    while True:
+        if cursor:
+            params["cursor"] = cursor
+        log(f"Moralis OHLCV: requesting page {page+1}...")
+        data = _moralis_get(url, params)
+        # Moralis folosește de obicei 'result' pentru listă
+        items = data.get("result") or data.get("items") or []
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected Moralis OHLCV response: {data}")
+        log(f"Moralis OHLCV: got {len(items)} items on this page.")
+        all_items.extend(items)
+
+        cursor = data.get("cursor") or data.get("nextCursor") or data.get("next_page")
+        page += 1
+        if not cursor:
+            break
+
+    log(f"Moralis OHLCV: total {len(all_items)} candles fetched.")
+    if not all_items:
+        raise RuntimeError("Moralis OHLCV: no data returned for TLNGOLD/USDT.")
+
+    normalized = []
+    for c in all_items:
+        ts = c.get("timestamp") or c.get("time")
+        if ts is None:
+            continue
+        try:
+            ts_int = int(ts)
+        except Exception:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                ts_int = int(dt.timestamp())
+            except Exception as e:
+                log(f"Skipping candle with invalid timestamp {ts}: {e}")
+                continue
+
+        def to_float(x):
+            if x is None:
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        normalized.append({
+            "timestamp_unix": ts_int,
+            "timestamp_iso": datetime.utcfromtimestamp(ts_int).isoformat() + "Z",
+            "open": to_float(c.get("open")),
+            "high": to_float(c.get("high")),
+            "low": to_float(c.get("low")),
+            "close": to_float(c.get("close")),
+            "volume": to_float(c.get("volume")),
+        })
+
+    # sortăm după timp
+    normalized.sort(key=lambda x: x["timestamp_unix"])
+    return normalized
+
+
+def rebuild_price_history_from_moralis(path=PRICE_FILE):
+    """
+    Reconstruiește price_history.csv în format OHLCV (Format A)
+    folosind istoricul complet Moralis pentru TLNGOLD/USDT.
+    """
+    candles = fetch_ohlcv_from_moralis()
+    fieldnames = ["timestamp_unix", "timestamp_iso", "open", "high", "low", "close", "volume"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in candles:
+            w.writerow(row)
+
+    log(f"Rebuilt {path} with {len(candles)} OHLCV candles from Moralis.")
+    return True
 
 # -----------------------------
 # Price fetch with caching/backoff
@@ -413,20 +541,19 @@ def run_live(poll_interval=POLL_INTERVAL):
     global LAST_PRICE, LAST_PRICE_TS, LAST_LOOP_TS, PRICE_SAMPLES_COUNT, _last_remote_export
     ensure_csv_headers()
 
-    # Attempt to fetch full history at startup. If found, rebuild price_history.csv.
-    full_hist = fetch_full_history_from_dexscreener()
-    if full_hist:
-        try:
-            with open(PRICE_FILE, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["timestamp", "price"])
-                for ts, price in full_hist:
-                    w.writerow([ts, f"{price:.8f}"])
-            log(f"Rebuilt {PRICE_FILE} with {len(full_hist)} points from Dexscreener.")
-        except Exception as e:
-            log(f"Error rebuilding price file: {e}")
-    else:
-        log("Full history unavailable; will use existing price_history.csv (if any).")
+    # La startup: dacă avem MORALIS_API_KEY, încercăm să reconstruim istoricul DOAR dacă
+    # fișierul e gol sau incomplet (Pornire B).
+    try:
+        if MORALIS_API_KEY:
+            if is_price_history_incomplete(PRICE_FILE):
+                log("price_history.csv missing or incomplete -> rebuilding from Moralis...")
+                rebuild_price_history_from_moralis(PRICE_FILE)
+            else:
+                log("price_history.csv seems OK; skipping Moralis rebuild.")
+        else:
+            log("MORALIS_API_KEY is not set; skipping Moralis price history rebuild.")
+    except Exception as e:
+        log(f"Moralis history init failed: {e}. Will continue with existing price_history.csv (if any).")
 
     state = load_state()
     price_buffer = []
@@ -441,7 +568,6 @@ def run_live(poll_interval=POLL_INTERVAL):
                 continue
 
             ts = int(time.time())
-            append_price(ts, price)
 
             # update global last price safely
             with _lock:
