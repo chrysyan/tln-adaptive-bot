@@ -1038,6 +1038,8 @@ def main_watchdog(mode="live", history_file=None):
                 return
             else:
                 run_live(POLL_INTERVAL)
+                # dacă run_live iese fără excepție, dormim ca să evităm loop turbo
+                time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             log("Interrupted by user. Exiting watchdog.")
             return
