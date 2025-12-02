@@ -789,6 +789,7 @@ def run_live(poll_interval=POLL_INTERVAL):
 
     # 2) Încărcăm state + istoricul OHLCV
     state = load_state()
+    usdt_balance_before = state.get("usdt", 0.0)
     candles = load_ohlcv_history(PRICE_FILE)
     if not candles or len(candles) < 50:
         log("LIVE: not enough OHLCV data; bot cannot trade safely.")
@@ -843,9 +844,6 @@ def run_live(poll_interval=POLL_INTERVAL):
                 log("LIVE: technical state not available; entry_plan not set.")
         else:
             log("LIVE: entry_plan already present in state; reusing it.")
-
-    # salvam USDT inițial
-    usdt_balance_before = usdt_balance
  
     price_buffer = []
 
