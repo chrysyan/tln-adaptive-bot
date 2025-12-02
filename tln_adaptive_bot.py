@@ -40,6 +40,9 @@ MORALIS_FROM_DATE = os.environ.get("MORALIS_FROM_DATE", "2024-01-01T00:00:00Z")
 HISTORY_MIN_POINTS = int(os.environ.get("HISTORY_MIN_POINTS", "100"))
 HISTORY_MAX_AGE_HOURS = int(os.environ.get("HISTORY_MAX_AGE_HOURS", "6"))
 
+# base directory setup
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # recommended cloud run params
 POLL_INTERVAL = 60              # seconds between checks
 ROLLING_WINDOW = 20
@@ -93,28 +96,29 @@ PRICE_SAMPLES_COUNT = 0
 _lock = threading.Lock()
 
 # -----------------------------
-# Utilities: rescrie state.json cu cel din GitHub
+# Utilities: rescrie state.json 
 # -----------------------------
-def reset_state_from_github():
+def reset_state_from_template():
     """
-    Rescrie state.json runtime cu versiunea din GitHub (copiată în container la build).
-    Folosește fișierul state.json existent în proiect ca sursă de adevăr.
+    La fiecare pornire, rescrie state.json runtime folosind fișierul
+    state_template.json (care vine din GitHub la fiecare deploy).
     """
-    github_state_path = os.path.join(BASE_DIR, "state.json")  # state.json din repo
-    runtime_state_path = os.path.join(BASE_DIR, "state.json") # runtime overwrite
+    template_path = os.path.join(BASE_DIR, "state_template.json")
+    runtime_path = os.path.join(BASE_DIR, "state.json")
 
     try:
-        with open(github_state_path, "r") as f:
-            initial_state = json.load(f)
+        # Citește șablonul oficial din GitHub
+        with open(template_path, "r") as f:
+            template_state = json.load(f)
 
-        # suprascriem versiunea runtime
-        with open(runtime_state_path, "w") as f:
-            json.dump(initial_state, f, indent=4)
+        # Rescrie state.json runtime
+        with open(runtime_path, "w") as f:
+            json.dump(template_state, f, indent=4)
 
-        log("[INIT] state.json a fost resetat cu versiunea din GitHub.")
+        log("[INIT] state.json resetat din state_template.json (GitHub).")
 
     except Exception as e:
-        log(f"[INIT] Eroare la resetarea state.json din GitHub: {e}")
+        log(f"[INIT] Eroare resetare state din template: {e}")
 
 # -----------------------------
 # Utilities: logging & csv
@@ -1208,11 +1212,9 @@ def main_watchdog(mode="live", history_file=None):
 # CLI
 # -----------------------------
 if __name__ == "__main__":
-    # ----------------------------------------------------------
-    # RESETARE AUTOMATA A STATE-ULUI DIN GITHUB LA FIECARE PORNIRE
-    # ----------------------------------------------------------
-    reset_state_from_github()
-
+    # Resetare automată a portofelului la fiecare pornire
+    reset_state_from_template()
+ 
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["live","backtest"], default="live")
