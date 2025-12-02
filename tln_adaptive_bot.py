@@ -196,7 +196,7 @@ def load_state():
         except Exception:
             log("load_state: failed to parse state.json, initializing new.")
     init = {
-        "usdt": 219.0,
+        "usdt": 200.0,
         "tln": 0.0,
         "last_trade_ts": None,
         "daily_spent": 0.0,
