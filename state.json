@@ -1,7 +1,8 @@
 {
-  "usdt": 39.0,
-  "tln": 538.1422807,
-  "last_trade_ts": 1763545164.2650156,
-  "daily_spent": 180.0,
-  "last_day": "2025-11-19"
+  "usdt": 200.0,
+  "tln": 0.0,
+  "last_trade_ts": null,
+  "daily_spent": 0.0,
+  "last_day": null,
+  "entry_plan": null
 }
