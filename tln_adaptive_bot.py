@@ -650,6 +650,16 @@ def simulate_buy(state, price, amount_usdt):
     save_state(state)
     append_trade(int(time.time()), "BUY", price, tln_bought, amount_to_use)
     log(f"SIM BUY: {tln_bought:.6f} TLN @ {price:.6f} (spent {amount_to_use:.4f} USDT)")
+    # --- Telegram notification for BUY executed ---
+    msg_buy = (
+        "🟢 <b>TLN Bot — BUY Executat</b>\n\n"
+        f"Preț BUY: <b>{price:.6f}</b>\n"
+        f"TLN cumpărat: <b>{tln_bought:.6f}</b>\n"
+        f"Suma folosită: <b>{amount_to_use:.2f} USDT</b>\n\n"
+        f"Balanță curentă USDT: {state.get('usdt',0.0):.2f}\n"
+        f"Mod: <b>waiting_for_sell</b>\n"
+    )
+    send_telegram_message(msg_buy)
     return True, None
 
 def simulate_sell(state, price, pct=1.0):
