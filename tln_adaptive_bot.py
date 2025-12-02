@@ -93,6 +93,30 @@ PRICE_SAMPLES_COUNT = 0
 _lock = threading.Lock()
 
 # -----------------------------
+# Utilities: rescrie state.json cu cel din GitHub
+# -----------------------------
+def reset_state_from_github():
+    """
+    Rescrie state.json runtime cu versiunea din GitHub (copiată în container la build).
+    Folosește fișierul state.json existent în proiect ca sursă de adevăr.
+    """
+    github_state_path = os.path.join(BASE_DIR, "state.json")  # state.json din repo
+    runtime_state_path = os.path.join(BASE_DIR, "state.json") # runtime overwrite
+
+    try:
+        with open(github_state_path, "r") as f:
+            initial_state = json.load(f)
+
+        # suprascriem versiunea runtime
+        with open(runtime_state_path, "w") as f:
+            json.dump(initial_state, f, indent=4)
+
+        log("[INIT] state.json a fost resetat cu versiunea din GitHub.")
+
+    except Exception as e:
+        log(f"[INIT] Eroare la resetarea state.json din GitHub: {e}")
+
+# -----------------------------
 # Utilities: logging & csv
 # -----------------------------
 def send_telegram_message(text: str):
@@ -1184,6 +1208,11 @@ def main_watchdog(mode="live", history_file=None):
 # CLI
 # -----------------------------
 if __name__ == "__main__":
+    # ----------------------------------------------------------
+    # RESETARE AUTOMATA A STATE-ULUI DIN GITHUB LA FIECARE PORNIRE
+    # ----------------------------------------------------------
+    reset_state_from_github()
+
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["live","backtest"], default="live")
