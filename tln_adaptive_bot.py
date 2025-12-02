@@ -95,6 +95,31 @@ _lock = threading.Lock()
 # -----------------------------
 # Utilities: logging & csv
 # -----------------------------
+def send_telegram_message(text: str):
+    """Trimite un mesaj Telegram folosind tokenul și chat_id-ul din variabilele de mediu."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    if not token or not chat_id:
+        log("Telegram not configured; skipping message.")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            log(f"Telegram error: {r.text}")
+        else:
+            log("Telegram message sent.")
+    except Exception as e:
+        log(f"Telegram exception: {e}")
+
 def now_iso():
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
@@ -493,41 +518,52 @@ def compute_technical_state(candles):
 # -----------------------------
 def compute_entry_levels(tech_state):
     """
-    Din starea tehnică derivăm:
+    Din starea tehnică derivăm nivelele CONSERVATOARE:
       - buy_price
       - take_profit
       - stop_loss
+
+    Stilul conservator pentru TLNGOLD:
+      - BUY = suport - 0.5 * ATR
+      - TP  = rezistență - 0.5 * ATR
+      - SL  = BUY - 3 * ATR
     """
     support = tech_state.get("support")
     resistance = tech_state.get("resistance")
     atr = tech_state.get("atr") or 0.0
+    # trend îl păstrăm în caz că vrem să-l folosim în versiunile viitoare,
+    # dar în varianta simplă conservatoare NU mai ajustăm după trend.
     trend = tech_state.get("trend")
 
     if support is None or resistance is None:
         log("Support/resistance missing; cannot compute entry levels.")
         return None
 
-    # BUY: în zona de suport, ajustat cu trend
-    buy_price = support
-    if trend == "bull" and atr > 0:
-        buy_price = support + 0.2 * atr
-    elif trend == "bear" and atr > 0:
-        buy_price = max(0.0, support - 0.5 * atr)
-
-    # TAKE PROFIT: în zona de rezistență, ușor ajustat
-    take_profit = resistance
-    if trend == "bear" and atr > 0:
-        take_profit = max(0.0, resistance - 0.2 * atr)
-    elif trend == "sideways" and atr > 0:
-        take_profit = max(0.0, resistance - 0.1 * atr)
-
-    # STOP LOSS: sub buy, în funcție de ATR
+    # BUY: zona de valoare, puțin sub suport (deep value)
     if atr > 0:
-        stop_loss = max(0.0, buy_price - 2.0 * atr)
+        buy_price = max(0.0, support - 0.5 * atr)
     else:
-        stop_loss = max(0.0, buy_price * 0.9)  # fallback simplu
+        # fallback: ușor sub suport
+        buy_price = max(0.0, support * 0.98)
 
-    log(f"Entry levels: buy={buy_price:.6f}, tp={take_profit:.6f}, sl={stop_loss:.6f}")
+    # TAKE PROFIT: puțin sub rezistență, ca să fie atins mai des
+    if atr > 0:
+        take_profit = max(0.0, resistance - 0.5 * atr)
+    else:
+        take_profit = max(0.0, resistance * 0.98)
+
+    # STOP LOSS: mult mai jos, stil conservator (3 * ATR)
+    if atr > 0:
+        stop_loss = max(0.0, buy_price - 3.0 * atr)
+    else:
+        # fallback: ~11% sub BUY
+        stop_loss = max(0.0, buy_price * 0.89)
+
+    log(
+        f"Entry levels (conservative): "
+        f"buy={buy_price:.6f}, tp={take_profit:.6f}, sl={stop_loss:.6f}, "
+        f"support={support:.6f}, resistance={resistance:.6f}, atr={atr:.6f}"
+    )
     return {
         "buy_price": buy_price,
         "take_profit": take_profit,
@@ -764,9 +800,20 @@ def run_live(poll_interval=POLL_INTERVAL):
             if tech:
                 levels = compute_entry_levels(tech)
                 if levels:
-                    # stabilim modul inițial în funcție de poziția curentă
+                    # TLN_V2 simplă: presupunem că acest ciclu pornește din USDT,
+                    # deci modul inițial este ÎNTOTDEAUNA "waiting_for_buy".
+                    # Dacă există deja TLN în portofel, doar logăm un avertisment,
+                    # dar nu tratăm poziția ca fiind "în curs" în această versiune.
                     tln_balance = state.get("tln", 0.0)
-                    mode = "waiting_for_buy" if tln_balance <= 0 else "waiting_for_sell"
+                    if tln_balance > 0:
+                        log(
+                            f"LIVE: WARNING - TLN balance={tln_balance:.6f} > 0, "
+                            "dar TLN_V2 simplă pornește din scenariul 'fără poziție'. "
+                            "Poziția existentă NU este gestionată de acest entry_plan."
+                        )
+
+                    mode = "waiting_for_buy"
+
                     state["entry_plan"] = {
                         "buy_price": levels["buy_price"],
                         "take_profit": levels["take_profit"],
@@ -776,6 +823,20 @@ def run_live(poll_interval=POLL_INTERVAL):
                     }
                     save_state(state)
                     log(f"LIVE: entry_plan initialized with mode={mode}.")
+                 
+                    # Mesaj Telegram la începutul ciclului
+                    msg = (
+                        "📊 <b>TLN Bot — Ciclul Nou a Început</b>\n\n"
+                        f"Trend: <b>{tech.get('trend')}</b>\n"
+                        f"Volatilitate: {tech.get('volatility_rel'):.4f}\n"
+                        f"ATR: {tech.get('atr'):.6f}\n\n"
+                        f"BUY: <b>{levels['buy_price']:.6f}</b>\n"
+                        f"TP: <b>{levels['take_profit']:.6f}</b>\n"
+                        f"SL: <b>{levels['stop_loss']:.6f}</b>\n\n"
+                        f"Capital disponibil: {state.get('usdt',0.0):.2f} USDT\n"
+                        f"Mod: <b>{mode}</b>\n"
+                    )
+                    send_telegram_message(msg)          
                 else:
                     log("LIVE: could not compute entry levels; entry_plan not set.")
             else:
@@ -783,6 +844,9 @@ def run_live(poll_interval=POLL_INTERVAL):
         else:
             log("LIVE: entry_plan already present in state; reusing it.")
 
+    # salvam USDT inițial
+    usdt_balance_before = usdt_balance
+ 
     price_buffer = []
 
     log(f"Starting LIVE mode. Version={BOT_VERSION}")
@@ -862,6 +926,34 @@ def run_live(poll_interval=POLL_INTERVAL):
                         state["entry_plan"] = entry_plan
                         save_state(state)
                         log("LIVE: entry_plan mode set to inactive (take profit reached).")
+                     
+                        # Reîncărcăm state-ul pentru balanțe actualizate
+                        final_state = load_state()
+                        final_usdt = final_state.get("usdt", 0.0)
+                        final_tln = final_state.get("tln", 0.0)
+                        
+                        msg_final = (
+                            "🏁 <b>TLN Bot — Ciclul s-a Încheiat</b>\n\n"
+                            f"BUY: <b>{entry_plan['buy_price']:.6f}</b>\n"
+                            f"SELL: <b>{price:.6f}</b>\n\n"
+                        )
+                        
+                        # profit/pierdere calculat simplu
+                        profit = final_usdt - usdt_balance_before
+                        pct = (profit / usdt_balance_before) * 100 if usdt_balance_before > 0 else 0
+                        
+                        if price >= entry_plan["take_profit"]:
+                            msg_final += f"🏆 <b>TAKE PROFIT</b> atins!\n"
+                        else:
+                            msg_final += f"⚠️ <b>STOP LOSS</b> activat.\n"
+                        
+                        msg_final += (
+                            f"\nProfit/Pierdere: <b>{profit:.2f} USDT ({pct:.2f}%)</b>\n"
+                            f"Balanță finală: <b>{final_usdt:.2f} USDT</b>\n"
+                            f"Mod: <b>inactive</b>\n"
+                        )
+                        
+                        send_telegram_message(msg_final)            
                     elif price <= stop_loss:
                         log("LIVE: price <= stop_loss -> SELL ALL (stop loss).")
                         simulate_sell(state, price, pct=1.0)
@@ -871,6 +963,34 @@ def run_live(poll_interval=POLL_INTERVAL):
                         state["entry_plan"] = entry_plan
                         save_state(state)
                         log("LIVE: entry_plan mode set to inactive (stop loss hit).")
+
+                        # Reîncărcăm state-ul pentru balanțe actualizate
+                        final_state = load_state()
+                        final_usdt = final_state.get("usdt", 0.0)
+                        final_tln = final_state.get("tln", 0.0)
+                        
+                        msg_final = (
+                            "🏁 <b>TLN Bot — Ciclul s-a Încheiat</b>\n\n"
+                            f"BUY: <b>{entry_plan['buy_price']:.6f}</b>\n"
+                            f"SELL: <b>{price:.6f}</b>\n\n"
+                        )
+                        
+                        # profit/pierdere calculat simplu
+                        profit = final_usdt - usdt_balance_before
+                        pct = (profit / usdt_balance_before) * 100 if usdt_balance_before > 0 else 0
+                        
+                        if price >= entry_plan["take_profit"]:
+                            msg_final += f"🏆 <b>TAKE PROFIT</b> atins!\n"
+                        else:
+                            msg_final += f"⚠️ <b>STOP LOSS</b> activat.\n"
+                        
+                        msg_final += (
+                            f"\nProfit/Pierdere: <b>{profit:.2f} USDT ({pct:.2f}%)</b>\n"
+                            f"Balanță finală: <b>{final_usdt:.2f} USDT</b>\n"
+                            f"Mod: <b>inactive</b>\n"
+                        )
+                        
+                        send_telegram_message(msg_final)             
                     else:
                         log("LIVE: waiting_for_sell -> HOLD (no TP/SL condition).")
             else:
